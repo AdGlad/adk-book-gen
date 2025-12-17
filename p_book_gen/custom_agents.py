@@ -65,6 +65,85 @@ from google.adk.agents.parallel_agent import ParallelAgent
 KDP_PAGEBREAK = "<mbp:pagebreak />"        # Kindle proprietary pagebreak
 MD_PAGEBREAK = "\n\n---\n\n"               # Markdown fallback for non-Kindle e-readers
 
+class QueueEpubJobAgent(BaseAgent):
+    """
+    Writes an EPUB build job JSON to GCS. This is what triggers Cloud Run via Eventarc.
+    Stores state['epub_job_gs_uri'] and state['book_epub_gs_uri'] (expected output location).
+    """
+
+    def __init__(self, *, name: str = "queue_epub_job_agent") -> None:
+        super().__init__(name=name, description="Queues an EPUB build job (job JSON) in GCS.")
+        self._storage_client = None
+
+    def _get_client(self) -> storage.Client:
+        if self._storage_client is None:
+            self._storage_client = storage.Client()
+        return self._storage_client
+
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        state = ctx.session.state
+
+        bucket_name = os.environ.get("BOOK_GEN_BUCKET")
+        if not bucket_name:
+            yield Event(author=self.name, content=genai_types.Content(
+                role="system",
+                parts=[genai_types.Part(text="BOOK_GEN_BUCKET is not set. Cannot queue EPUB job.")]
+            ))
+            return
+
+        manuscript_gs_uri = state.get("book_gs_uri")  # produced by SaveManuscriptAgent
+        if not isinstance(manuscript_gs_uri, str) or not manuscript_gs_uri.startswith("gs://"):
+            yield Event(author=self.name, content=genai_types.Content(
+                role="system",
+                parts=[genai_types.Part(text="book_gs_uri is missing/invalid. Cannot queue EPUB job.")]
+            ))
+            return
+
+        # Canonical metadata resolved earlier in your workflow
+        title = (state.get("book_title") or "Untitled Book").strip()
+        subtitle = (state.get("book_subtitle") or "").strip()
+        author = (state.get("book_author") or state.get("author_name") or "Unknown Author").strip()
+
+        session_id = ctx.session.id
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        random_id = uuid.uuid4().hex[:8]
+
+        # Match your GCS layout & the Cloud Run guard: must be under /jobs/ and end with -epub-job.json
+        job_object_name = f"books/run-{session_id}/jobs/{timestamp}-{random_id}-epub-job.json"
+
+        # Where the worker should write the resulting EPUB:
+        epub_object_name = f"books/run-{session_id}/epub/{timestamp}-{random_id}.epub"
+        output_epub_gs_uri = f"gs://{bucket_name}/{epub_object_name}"
+
+        job = {
+            "job_id": random_id,
+            "session_id": session_id,
+            "manuscript_gs_uri": manuscript_gs_uri,
+            "output_epub_gs_uri": output_epub_gs_uri,
+            "metadata": {
+                "title": title,
+                "subtitle": subtitle,
+                "author": author,
+                "lang": "en-GB",
+            },
+        }
+
+        client = self._get_client()
+        bucket = client.bucket(bucket_name)
+        bucket.blob(job_object_name).upload_from_string(
+            json.dumps(job, ensure_ascii=False, indent=2),
+            content_type="application/json; charset=utf-8",
+        )
+
+        job_gs_uri = f"gs://{bucket_name}/{job_object_name}"
+        state["epub_job_gs_uri"] = job_gs_uri
+        state["book_epub_gs_uri"] = output_epub_gs_uri  # expected output location
+
+        yield Event(author=self.name, content=genai_types.Content(
+            role="system",
+            parts=[genai_types.Part(text=f"Queued EPUB job: {job_gs_uri}\nOutput will be: {output_epub_gs_uri}")]
+        ))
+
 class SaveEndMatterAgent(BaseAgent):
     """
     Saves end-matter sections (conclusion, action plan, etc.) from state to GCS.
@@ -1535,7 +1614,8 @@ def build_full_workflow_agent(max_chapters: int = 20) -> SequentialAgent:
     merge_agent = MergeFromGcsAgent()          # <- use the deterministic GCS-based merge
     save_manuscript_agent = SaveManuscriptAgent()
     save_cover_prompts_agent = SaveCoverPromptsAgent()
-    build_epub_agent = BuildEpubAgent()
+    #build_epub_agent = BuildEpubAgent()
+    queue_epub_job_agent = QueueEpubJobAgent()
     title_synthesis_agent = build_title_synthesis_agent()
     parse_title_agent = ParseTitleSynthesisAgent()
     conclusion_agent = build_conclusion_agent()
@@ -1568,7 +1648,7 @@ def build_full_workflow_agent(max_chapters: int = 20) -> SequentialAgent:
             save_end_matter_agent,
             merge_agent,
             save_manuscript_agent,
-            build_epub_agent,        # ← here
+            queue_epub_job_agent,    # queues job JSON to trigger Cloud Run pandoc worker
             save_cover_prompts_agent,
                     ],
     )
