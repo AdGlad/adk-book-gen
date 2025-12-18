@@ -65,6 +65,60 @@ from google.adk.agents.parallel_agent import ParallelAgent
 KDP_PAGEBREAK = "<mbp:pagebreak />"        # Kindle proprietary pagebreak
 MD_PAGEBREAK = "\n\n---\n\n"               # Markdown fallback for non-Kindle e-readers
 
+class ProseNormaliserAgent(BaseAgent):
+    def __init__(self, *, name: str = "prose_normaliser_agent") -> None:
+        super().__init__(name=name, description="Deterministically removes AI-signalling formatting.")
+
+    def _normalise(self, md: str) -> str:
+        text = md
+
+        # 1) Replace semicolons (strong signal)
+        text = text.replace(";", ".")
+
+        # 2) Remove bold lead-in labels at paragraph starts
+        # e.g. **Key idea:** blah -> blah
+        text = re.sub(r'(?m)^\*\*[^*\n]{2,40}\*\*:\s*', '', text)
+
+        # 3) Convert bullet/numbered list blocks into paragraphs
+        # Join consecutive list lines into one paragraph.
+        def _join_list_block(match):
+            block = match.group(0)
+            lines = [re.sub(r'^\s*(?:[-*•]|\d+\.)\s+', '', ln).strip() for ln in block.splitlines()]
+            lines = [ln for ln in lines if ln]
+            return "\n\n" + " ".join(lines) + "\n\n"
+
+        # Bullet blocks
+        text = re.sub(r'(?ms)(?:^\s*(?:[-*•])\s+.+\n)+', _join_list_block, text)
+        # Numbered blocks
+        text = re.sub(r'(?ms)(?:^\s*\d+\.\s+.+\n)+', _join_list_block, text)
+
+        # 4) Demote accidental ### headings into plain text
+        text = re.sub(r'(?m)^#{3,6}\s+', '', text)
+
+        # 5) Clean spacing
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'[ \t]{2,}', ' ', text)
+
+        return text.strip() + "\n"
+
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        state = ctx.session.state
+        manuscript = state.get("book_manuscript")
+        if not isinstance(manuscript, str) or not manuscript.strip():
+            yield Event(author=self.name, content=genai_types.Content(
+                role="system",
+                parts=[genai_types.Part(text="No manuscript found to normalise.")]
+            ))
+            return
+
+        state["book_manuscript"] = self._normalise(manuscript)
+
+        yield Event(author=self.name, content=genai_types.Content(
+            role="system",
+            parts=[genai_types.Part(text="Normalised manuscript formatting (lists/bold lead-ins/semicolons).")]
+        ))
+
+
 class QueueEpubJobAgent(BaseAgent):
     """
     Writes an EPUB build job JSON to GCS. This is what triggers Cloud Run via Eventarc.
@@ -661,6 +715,7 @@ def _chapter_instruction(chapter_number: int) -> str:
     """
     return f"""
 You are a specialist non-fiction book writer for chapter {chapter_number} of a Kindle book.
+Do not write in “workshop facilitator” tone. Write like an author: opinionated, specific, occasionally anecdotal, and willing to linger on a point for a full paragraph before moving on.
 
 The user will provide ONE JSON object as their first message. It will include fields like:
 - book_topic
@@ -679,12 +734,7 @@ Your task for chapter {chapter_number}:
 
 0. Carefully read and parse the JSON object from the user message.
    - Look for the field "min_chapters".
-   - If "min_chapters" is present and {chapter_number} is greater than that value,
-     then do NOT write a normal chapter. Instead, respond with exactly the single line:
 
-       SKIP_CHAPTER
-
-     and nothing else (no headings, no quotes, no prose).
    - If "min_chapters" is not present, assume that all configured chapters should be written.
 
 1. If you are not skipping this chapter, read the outline that was generated earlier and
@@ -736,6 +786,23 @@ Style and tone:
 - UK English spelling.
 - Clear, confident, practical, and aimed at the specified target audience.
 - Ensure the chapter clearly connects back to the quote and shows why it matters for the reader.
+Hard bans (must not appear anywhere in the chapter):
+- No bullet lists, numbered lists, or checklist formatting of any kind.
+  (No lines starting with '-', '*', '•', '1.', '2.', etc.)
+- No bold lead-in labels such as:
+  **Key idea:**, **In practice:**, **Step 1:**, **Tip:**, **Summary:**
+- No colon-led “label: sentence” structures at paragraph starts.
+- Avoid semicolons. Prefer full stops or commas.
+- Do not write in “framework voice” (e.g., “First… Second… Third…”).
+- Do not use subheadings beyond the single required H2 chapter heading.
+
+Narrative style requirements:
+- Write as continuous, human prose with paragraphs that flow.
+- Use varied sentence length and occasional rhetorical questions.
+- Use concrete examples and small situational vignettes (1–3 sentences) to ground concepts.
+- Use transitions between paragraphs (e.g., “That’s where…”, “The point is…”, “What this looks like on a wet Tuesday night…”).
+- If structure is needed, do it implicitly via paragraphing, not formatting.
+
 
 """
 
@@ -1525,7 +1592,7 @@ def _action_plan_instruction() -> str:
 You are a specialist non-fiction book writer creating a practical action plan to help the reader apply the book.
 
 Write a section that:
-- Turns the book into a 30/60/90-day plan (or similar time-boxed plan).
+- Write it as a narrative plan in three phases (first month, next two months, following three months), but expressed as flowing paragraphs with minimal signposting. No lists, no labelled steps, no bold lead-ins.
 - Uses short paragraphs and clear structure, but do NOT use bullet points.
 - Gives concrete, realistic actions aligned to the target audience.
 
@@ -1611,7 +1678,7 @@ def build_full_workflow_agent(max_chapters: int = 20) -> SequentialAgent:
 
     parallel_agent = build_parallel_book_agent(num_chapters)
     save_chapters_agent = SaveChaptersAgent(num_chapters=num_chapters)
-    merge_agent = MergeFromGcsAgent()          # <- use the deterministic GCS-based merge
+    #merge_agent = MergeFromGcsAgent()          # <- use the deterministic GCS-based merge
     save_manuscript_agent = SaveManuscriptAgent()
     save_cover_prompts_agent = SaveCoverPromptsAgent()
     #build_epub_agent = BuildEpubAgent()
@@ -1623,6 +1690,8 @@ def build_full_workflow_agent(max_chapters: int = 20) -> SequentialAgent:
     save_end_matter_agent = SaveEndMatterAgent()
     merge_from_gcs_agent = MergeFromGcsAgent()  # use this, not the LLM merge agent
     parse_spec_agent = ParseSpecAgent()
+    prose_normaliser_agent = ProseNormaliserAgent()
+
 
 
     workflow = SequentialAgent(
@@ -1646,7 +1715,9 @@ def build_full_workflow_agent(max_chapters: int = 20) -> SequentialAgent:
             conclusion_agent,
             action_plan_agent,
             save_end_matter_agent,
-            merge_agent,
+            merge_from_gcs_agent ,
+            #merge_agent,
+            #prose_normaliser_agent,
             save_manuscript_agent,
             queue_epub_job_agent,    # queues job JSON to trigger Cloud Run pandoc worker
             save_cover_prompts_agent,
